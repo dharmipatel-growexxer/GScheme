@@ -12,7 +12,7 @@ export interface ChatMessage {
   content: string;
 }
 
-const API_BASE = "http://127.0.0.1:8501/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8501/api";
 
 // Connect to FastAPI Search
 export async function searchSchemes(query: string): Promise<Scheme[]> {
