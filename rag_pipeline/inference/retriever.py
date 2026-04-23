@@ -8,8 +8,11 @@ Two modes:
 from __future__ import annotations
 
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -25,6 +28,7 @@ from rag_pipeline.config import (
     QDRANT_COLLECTION_NAME,
     SPARSE_VECTOR_NAME,
 )
+from rag_pipeline.knowledge_base.data_loader import load_all_schemes
 from rag_pipeline.knowledge_base.embeddings import get_embedding_model
 
 load_dotenv()
@@ -272,34 +276,137 @@ def search_schemes_by_name(
     top_k: int = DISCOVERY_TOP_K,
 ) -> List[SchemeResult]:
     """
-    Search schemes directly by name or description without strict user profiling.
+    Search schemes by KB scheme_name only.
+
+    This path intentionally avoids semantic content retrieval so that results
+    are returned only when the scheme title itself matches the user's query.
     """
-    client = get_qdrant_client()
-    emb = get_embedding_model()
-
-    # Broad filter: only details and eligibility chunks
-    from qdrant_client.http import models
-
-    qdrant_filter = models.Filter(
-        must=[
-            models.FieldCondition(
-                key="chunk_type",
-                match=models.MatchAny(any=["eligibility", "details"]),
-            )
-        ]
-    )
-
-    dense_vecs, sparse_vecs = emb.embed_documents_hybrid([query_text])
-    dense = dense_vecs[0]
-    sparse = sparse_vecs[0]
-
-    points = _hybrid_search(client, dense, sparse, qdrant_filter)
-    if not points:
+    query_text = (query_text or "").strip()
+    if not query_text:
         return []
 
-    schemes = _group_points_by_scheme(points)
-    # Return more than top_k so reranker can pick the best
-    return schemes[: DISCOVERY_RERANK_CANDIDATES]
+    normalized_query = _normalize_scheme_name(query_text)
+    query_tokens = _tokenize_scheme_name(query_text)
+    if not normalized_query or not query_tokens:
+        return []
+
+    ranked_matches = []
+    for scheme in _load_scheme_name_index():
+        name = scheme["scheme_name"]
+        normalized_name = scheme["normalized_name"]
+        name_tokens = scheme["tokens"]
+        score = _score_scheme_name_match(
+            normalized_query,
+            query_tokens,
+            normalized_name,
+            name_tokens,
+        )
+        if score < 0.45:
+            continue
+
+        ranked_matches.append(
+            SchemeResult(
+                scheme_id=scheme["scheme_id"],
+                scheme_name=name,
+                scheme_url=scheme["scheme_url"],
+                location_name=scheme["location_name"],
+                category_id=scheme["category_id"],
+                category_name=scheme["category_name"],
+                score=score,
+                chunks=[],
+            )
+        )
+
+    ranked_matches.sort(key=lambda s: (-s.score, len(s.scheme_name), s.scheme_name))
+    return ranked_matches[: max(top_k, DISCOVERY_RERANK_CANDIDATES)]
+
+
+def _normalize_scheme_name(text: str) -> str:
+    """Normalize scheme names/queries for strict title matching."""
+    normalized = (text or "").lower()
+
+    replacements = {
+        "&": " and ",
+        "/": " ",
+        "-": " ",
+        "_": " ",
+        "yojna": " yojana ",
+        "yojan": " yojana ",
+    }
+    for src, target in replacements.items():
+        normalized = normalized.replace(src, target)
+
+    # Expand a few common title-search abbreviations without changing KB data.
+    normalized = re.sub(r"\bpm\b", "pradhan mantri", normalized)
+    normalized = re.sub(r"\bcm\b", "chief minister", normalized)
+
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _tokenize_scheme_name(text: str) -> List[str]:
+    """Split a normalized scheme title into meaningful tokens."""
+    return [tok for tok in _normalize_scheme_name(text).split() if tok]
+
+
+def _score_scheme_name_match(
+    normalized_query: str,
+    query_tokens: List[str],
+    normalized_name: str,
+    name_tokens: List[str],
+) -> float:
+    """Rank candidate schemes using title-only similarity signals."""
+    if not normalized_name:
+        return 0.0
+
+    if normalized_query == normalized_name:
+        return 1.0
+
+    if normalized_name.startswith(normalized_query):
+        return 0.96
+
+    if normalized_query in normalized_name:
+        coverage = len(query_tokens) / max(len(name_tokens), 1)
+        return 0.9 + min(coverage, 1.0) * 0.05
+
+    query_token_set = set(query_tokens)
+    name_token_set = set(name_tokens)
+    overlap = len(query_token_set & name_token_set)
+    token_recall = overlap / max(len(query_token_set), 1)
+    token_precision = overlap / max(len(name_token_set), 1)
+    fuzzy = SequenceMatcher(None, normalized_query, normalized_name).ratio()
+
+    # Require at least a reasonably meaningful signal from the title itself.
+    if overlap == 0 and fuzzy < 0.75:
+        return 0.0
+
+    return max(
+        fuzzy * 0.78 + token_recall * 0.17 + token_precision * 0.05,
+        token_recall * 0.82 + fuzzy * 0.18,
+    )
+
+
+@lru_cache(maxsize=1)
+def _load_scheme_name_index() -> tuple[Dict[str, Any], ...]:
+    """Load canonical scheme names from the knowledge base for title search."""
+    schemes = load_all_schemes(verbose=False)
+    index = []
+    for scheme in schemes:
+        normalized_name = _normalize_scheme_name(scheme.scheme_name)
+        index.append(
+            {
+                "scheme_id": scheme.scheme_id,
+                "scheme_name": scheme.scheme_name,
+                "scheme_url": scheme.scheme_url,
+                "location_name": scheme.location_name,
+                "category_id": scheme.category_id,
+                "category_name": scheme.category_name,
+                "normalized_name": normalized_name,
+                "tokens": tuple(tok for tok in normalized_name.split() if tok),
+            }
+        )
+    return tuple(index)
 
 
 def _hybrid_search(client, dense, sparse, qdrant_filter, limit=DISCOVERY_INITIAL_FETCH):

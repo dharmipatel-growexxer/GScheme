@@ -133,14 +133,14 @@ def prepare_discovery_candidates(
 def prepare_search_candidates(
     query_text: str,
 ) -> List[SchemeResult]:
-    """Retrieve and rank all candidates based on a direct search query."""
+    """Retrieve and rank direct search candidates using scheme titles only."""
     candidates = search_schemes_by_name(query_text)
     if not candidates:
         return []
 
     if USE_RERANKER:
         reranker = get_reranker()
-        passages = [s.combined_text[:2000] for s in candidates]
+        passages = [s.scheme_name for s in candidates]
         ranked = reranker.rerank(query_text, passages, top_k=len(candidates))
         top_schemes = [candidates[idx] for idx, _score in ranked]
 
